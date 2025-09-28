@@ -1,3 +1,4 @@
+
 import React, { useRef, useEffect } from 'react';
 import { Message as MessageType } from '../types';
 import Message from './Message';
@@ -33,7 +34,11 @@ const DebateView: React.FC<DebateViewProps> = ({ messages, isLoading, currentlyS
       className="flex-1 w-full p-6 space-y-6 overflow-y-auto bg-black/30 rounded-lg"
     >
       {messages.map((msg, index) => (
-        <Message key={index} message={msg} isSpeaking={index === currentlySpeakingIndex} />
+        <Message 
+          key={index} 
+          message={msg} 
+          isSpeaking={index === currentlySpeakingIndex}
+        />
       ))}
       {isLoading && <TypingIndicator />}
     </div>

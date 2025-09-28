@@ -1,26 +1,7 @@
 
-import { GoogleGenAI, LiveServerMessage, Modality, Blob } from '@google/genai';
-
-// Fix: Infer the LiveSession type as it's not directly exported from the library.
-type LiveSession = Awaited<ReturnType<InstanceType<typeof GoogleGenAI>['live']['connect']>>;
-
-export class MicrophonePermissionError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = 'MicrophonePermissionError';
-    }
-}
+import { GoogleGenAI } from '@google/genai';
 
 // Base64 and audio decoding/encoding utilities
-function encode(bytes: Uint8Array) {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
-}
-
 function decode(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -37,6 +18,7 @@ async function decodeAudioData(
   sampleRate: number,
   numChannels: number,
 ): Promise<AudioBuffer> {
+  // This assumes the data is raw PCM 16-bit signed integers.
   const dataInt16 = new Int16Array(data.buffer);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
@@ -44,6 +26,7 @@ async function decodeAudioData(
   for (let channel = 0; channel < numChannels; channel++) {
     const channelData = buffer.getChannelData(channel);
     for (let i = 0; i < frameCount; i++) {
+      // Normalize from [-32768, 32767] to [-1, 1]
       channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
     }
   }
@@ -51,9 +34,8 @@ async function decodeAudioData(
 }
 
 
-interface UtteranceJob {
-    text: string;
-    voiceName: string;
+interface PlaybackJob {
+    audioBuffer: AudioBuffer;
     onStart: () => void;
     onEnd: () => void;
 }
@@ -61,15 +43,10 @@ interface UtteranceJob {
 class GeminiTTSService {
     private ai: GoogleGenAI;
     private outputAudioContext: AudioContext;
-    private utteranceQueue: UtteranceJob[] = [];
-    private currentSession: LiveSession | null = null;
+    private playbackQueue: PlaybackJob[] = [];
     private sources = new Set<AudioBufferSourceNode>();
-    private nextStartTime = 0;
-    private microphoneStream: MediaStream | null = null;
-    private isInitializingMic = false;
-
-    public onStateChange: (state: { isSpeaking: boolean, isPaused: boolean }) => void = () => {};
-    public onError: (error: Error) => void = () => {};
+    private isPlaying = false;
+    private currentJob: PlaybackJob | null = null;
 
     constructor() {
         if (!process.env.API_KEY) {
@@ -79,199 +56,109 @@ class GeminiTTSService {
         this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
 
-    private async initializeMicrophone(): Promise<void> {
-        if (this.microphoneStream) return;
-        if (this.isInitializingMic) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-            return this.initializeMicrophone();
-        }
-
-        this.isInitializingMic = true;
+    public async generateAudio(text: string, voiceName: string): Promise<AudioBuffer | null> {
         try {
-            this.microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const response = await this.ai.models.generateContent({
+                model: "gemini-2.5-flash-preview-tts",
+                contents: [{ parts: [{ text }] }],
+                config: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: {
+                        voiceConfig: {
+                            prebuiltVoiceConfig: { voiceName },
+                        },
+                    },
+                },
+            });
+
+            const data = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+            if (data) {
+                const audioBytes = decode(data);
+                return await decodeAudioData(audioBytes, this.outputAudioContext, 24000, 1);
+            } else {
+                console.error("TTS API returned no audio data.");
+                return null;
+            }
         } catch (error) {
-            console.error("Microphone access is required for AI voices to work.", error);
-            throw new MicrophonePermissionError("Microphone permission was denied. This is required for text-to-speech functionality.");
-        } finally {
-            this.isInitializingMic = false;
+            console.error("Error generating TTS content:", error);
+            return null;
         }
     }
 
-    private updateState() {
-        const isSpeaking = this.isBusy();
-        const isPaused = this.outputAudioContext.state === 'suspended';
-        this.onStateChange({ isSpeaking, isPaused });
-    }
-
-    public isBusy(): boolean {
-        return this.utteranceQueue.length > 0 || this.sources.size > 0 || !!this.currentSession;
-    }
-    
-    public speak(job: UtteranceJob) {
+    public play(job: PlaybackJob) {
         if (this.outputAudioContext.state === 'suspended') {
             this.outputAudioContext.resume().catch(e => console.error("Error resuming AudioContext", e));
         }
-        this.utteranceQueue.push(job);
-        if (!this.currentSession) {
-            this.processQueue();
+        this.playbackQueue.push(job);
+        if (!this.isPlaying) {
+            this.processPlaybackQueue();
         }
     }
 
-    private async processQueue() {
-        if (this.currentSession || this.utteranceQueue.length === 0) {
+    private async processPlaybackQueue() {
+        if (this.isPlaying || this.playbackQueue.length === 0) {
+            return;
+        }
+        this.isPlaying = true;
+
+        this.currentJob = this.playbackQueue.shift();
+        if (!this.currentJob) {
+            this.isPlaying = false;
             return;
         }
 
-        try {
-            await this.initializeMicrophone();
-        } catch (error) {
-            console.error("TTS failed due to microphone initialization.", error);
-            if (error instanceof MicrophonePermissionError) {
-                this.onError(error);
-            }
-            this.utteranceQueue = []; // Clear queue on critical error
-            this.updateState();
-            return;
-        }
-
-
-        const job = this.utteranceQueue.shift();
-        if (!job) return;
-
+        const job = this.currentJob;
         job.onStart();
-        this.updateState();
-
-        const inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-        let audioSource: MediaStreamAudioSourceNode | null = null;
-        let audioProcessor: ScriptProcessorNode | null = null;
 
         try {
-            const sessionPromise = this.ai.live.connect({
-                model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-                callbacks: {
-                    onopen: () => {
-                        if (!this.microphoneStream) return;
-                        audioSource = inputAudioContext.createMediaStreamSource(this.microphoneStream);
-                        audioProcessor = inputAudioContext.createScriptProcessor(4096, 1, 1);
+            if (this.outputAudioContext.state === 'suspended') {
+                await this.outputAudioContext.resume();
+            }
 
-                        audioProcessor.onaudioprocess = (audioProcessingEvent) => {
-                            const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
-                            const int16 = new Int16Array(inputData.length);
-                            for (let i = 0; i < inputData.length; i++) {
-                                // Mute the audio by sending zeros
-                                int16[i] = 0;
-                            }
-                            const pcmBlob: Blob = {
-                                data: encode(new Uint8Array(int16.buffer)),
-                                mimeType: 'audio/pcm;rate=16000',
-                            };
-                            sessionPromise.then((session) => {
-                                if (this.currentSession === session) {
-                                    session.sendRealtimeInput({ media: pcmBlob });
-                                }
-                            });
-                        };
-                        audioSource.connect(audioProcessor);
-                        audioProcessor.connect(inputAudioContext.destination);
+            const source = this.outputAudioContext.createBufferSource();
+            source.buffer = job.audioBuffer;
+            source.connect(this.outputAudioContext.destination);
 
-                        sessionPromise.then(session => {
-                            session.sendRealtimeInput({ text: job.text });
-                        }).catch(e => console.error("Error sending realtime input:", e));
-                    },
-                    onmessage: async (message: LiveServerMessage) => {
-                        const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData.data;
-                        if (base64Audio) {
-                            this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext.currentTime);
-                            const audioBuffer = await decodeAudioData(decode(base64Audio), this.outputAudioContext, 24000, 1);
-                            const source = this.outputAudioContext.createBufferSource();
-                            source.buffer = audioBuffer;
-                            source.connect(this.outputAudioContext.destination);
-                            source.addEventListener('ended', () => {
-                                this.sources.delete(source);
-                                this.updateState();
-                            });
-                            source.start(this.nextStartTime);
-                            this.nextStartTime += audioBuffer.duration;
-                            this.sources.add(source);
-                        }
-
-                        if (message.serverContent?.turnComplete) {
-                           sessionPromise.then(session => session.close()).catch(e => console.error("Error closing session:", e));
-                        }
-                    },
-                    onerror: (e: ErrorEvent) => {
-                        console.error('Gemini Live API Error:', e);
-                        audioSource?.disconnect();
-                        audioProcessor?.disconnect();
-                        inputAudioContext.close().catch(e => console.error("Error closing input audio context:", e));
-                        job.onEnd();
-                        this.currentSession = null;
-                        this.updateState();
-                        this.processQueue();
-                    },
-                    onclose: () => {
-                        audioSource?.disconnect();
-                        audioProcessor?.disconnect();
-                        inputAudioContext.close().catch(e => console.error("Error closing input audio context:", e));
-
-                        const timeToWait = (this.nextStartTime - this.outputAudioContext.currentTime) * 1000;
-                        setTimeout(() => {
-                           job.onEnd();
-                           this.currentSession = null;
-                           this.updateState();
-                           this.processQueue();
-                        }, Math.max(0, timeToWait) + 100);
-                    },
-                },
-                config: {
-                    responseModalities: [Modality.AUDIO],
-                    speechConfig: {
-                        voiceConfig: { prebuiltVoiceConfig: { voiceName: job.voiceName } },
-                    },
-                    systemInstruction: 'You are a text-to-speech engine. When you receive text input, you must read it back verbatim, in a clear and natural voice. Do not add any other words or commentary.',
-                },
-            });
-            this.currentSession = await sessionPromise;
+            source.onended = () => {
+                this.sources.delete(source);
+                if (this.currentJob === job) {
+                    job.onEnd();
+                    this.currentJob = null;
+                    this.isPlaying = false;
+                    this.processPlaybackQueue();
+                }
+            };
+            
+            this.sources.add(source);
+            source.start();
         } catch (error) {
-            console.error("Failed to connect to Gemini Live API:", error);
+            console.error("Error playing audio:", error);
             job.onEnd();
-            this.updateState();
-            inputAudioContext.close().catch(e => console.error("Error closing input audio context:", e));
-            this.processQueue();
-        }
-    }
-
-    public pause() {
-        if (this.outputAudioContext.state === 'running') {
-            this.outputAudioContext.suspend().then(() => this.updateState());
-        }
-    }
-
-    public resume() {
-        if (this.outputAudioContext.state === 'suspended') {
-            this.outputAudioContext.resume().then(() => this.updateState());
+            this.currentJob = null;
+            this.isPlaying = false;
+            this.processPlaybackQueue();
         }
     }
 
     public cancel() {
-        this.utteranceQueue = [];
-        
+        this.playbackQueue = [];
         this.sources.forEach(source => {
             try {
+                source.onended = null;
                 source.stop();
             } catch(e) {
                 console.warn("Error stopping audio source:", e);
             }
         });
         this.sources.clear();
-        this.nextStartTime = 0;
-
-        if (this.currentSession) {
-            this.currentSession.close();
-            this.currentSession = null;
-        }
         
-        this.updateState();
+        if (this.currentJob) {
+            this.currentJob.onEnd();
+            this.currentJob = null;
+        }
+
+        this.isPlaying = false;
     }
 }
 

@@ -1,3 +1,4 @@
+
 import { GoogleGenAI } from "@google/genai";
 import { Debater, Message } from '../types';
 
@@ -32,6 +33,8 @@ a) Carefully analyze your opponent's (${opponent}) latest argument to identify i
 b) When presenting a counter-argument, use clear, concise, and logical reasoning.
 c) Ask probing questions to encourage your opponent to elaborate on their points, which may reveal further weaknesses.
 d) Introduce evidence and facts to support your claims where appropriate.
+e) Your response must not exceed 4 sentences in length.
+f) Use clear and accessible language. Avoid jargon, overly complex sentences, and advanced vocabulary to ensure the debate is easy for a general audience to follow.
 
 Tone and Conduct:
 a) Maintain a 'brutal' but fair debating style. This means being relentless in dissecting arguments, but never resorting to insults or condescension.

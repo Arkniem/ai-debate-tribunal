@@ -1,3 +1,4 @@
+
 import React from 'react';
 import { Debater, Message as MessageType } from '../types';
 import { PodiumIcon } from './icons/PodiumIcon';
@@ -30,7 +31,7 @@ const Message: React.FC<MessageProps> = ({ message, isSpeaking }) => {
         </div>
         <div className="flex flex-col">
            <span className={`text-sm font-bold mb-1 ${authorClasses} ${isAlpha ? 'text-left' : 'text-right'}`}>{message.author}</span>
-           <div className={`p-4 rounded-2xl transition-shadow duration-300 ${bubbleClasses} ${speakingClasses}`}>
+           <div className={`relative p-4 rounded-2xl transition-shadow duration-300 ${bubbleClasses} ${speakingClasses}`}>
              <p className="text-base whitespace-pre-wrap text-gray-200">{message.text}</p>
            </div>
         </div>

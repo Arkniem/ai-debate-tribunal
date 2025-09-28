@@ -1,14 +1,21 @@
+
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Debater, Message } from './types';
 import { getAIResponse } from './services/geminiService';
-import { ttsService, MicrophonePermissionError } from './services/ttsService';
+import { ttsService } from './services/ttsService';
 import TopicInput from './components/TopicInput';
 import DebateView from './components/DebateView';
 import ScalesIcon from './components/icons/ScalesIcon';
 
 // High-quality voices for the AI Debaters.
-const AI_ALPHA_VOICE = 'Zephyr';
-const AI_BETA_VOICE = 'Puck';
+const AI_ALPHA_VOICE = 'Autonoe';
+const AI_BETA_VOICE = 'Schedar';
+const PRELOAD_TARGET_COUNT = 6; // 3 responses per debater
+
+interface PreloadedResponse {
+  message: Message;
+  audioBuffer: AudioBuffer | null;
+}
 
 const App: React.FC = () => {
   const [topic, setTopic] = useState<string>('');
@@ -20,40 +27,29 @@ const App: React.FC = () => {
   const [currentlySpeakingIndex, setCurrentlySpeakingIndex] = useState<number | null>(null);
   
   const isDebatingRef = useRef(isDebating);
+  const preloadedQueueRef = useRef<PreloadedResponse[]>([]);
 
   useEffect(() => {
     isDebatingRef.current = isDebating;
   }, [isDebating]);
 
   useEffect(() => {
-    const handleError = (error: Error) => {
-        if (error instanceof MicrophonePermissionError) {
-            setError("Microphone access is required for AI voices. Please grant permission and try again.");
-            handleStopDebate();
-        }
-    }
-    
-    ttsService.onError = handleError;
-
+    // Cleanup TTS service on component unmount
     return () => {
       ttsService.cancel();
-      ttsService.onError = () => {};
     };
   }, []);
 
-  const speakMessage = useCallback((message: Message, index: number): Promise<void> => {
+  const speakBuffer = useCallback((audioBuffer: AudioBuffer, index: number): Promise<void> => {
     return new Promise((resolve) => {
       if (!isDebatingRef.current) {
         resolve();
         return;
       }
       
-      const voiceName = message.author === Debater.Alpha ? AI_ALPHA_VOICE : AI_BETA_VOICE;
-
       setCurrentlySpeakingIndex(index);
-      ttsService.speak({
-        text: message.text,
-        voiceName,
+      ttsService.play({
+        audioBuffer,
         onStart: () => {},
         onEnd: () => {
           setCurrentlySpeakingIndex(null);
@@ -68,49 +64,98 @@ const App: React.FC = () => {
     setError(null);
     setDebateHistory([]);
     setIsDebateFinished(false);
+    preloadedQueueRef.current = []; // Reset queue for new debate
 
-    const history: Message[] = [];
-    let currentDebater = Debater.Alpha;
-    let nextResponsePromise: Promise<string> | null = null;
+    let tempHistory: Message[] = [];
+    let activeGenerators = 0;
 
-    try {
-      while (isDebatingRef.current) {
-        setIsLoading(true);
-        
-        const currentResponseText = nextResponsePromise
-          ? await nextResponsePromise
-          : await getAIResponse(newTopic, currentDebater, history);
+    const addToQueue = (response: PreloadedResponse) => {
+      preloadedQueueRef.current.push(response);
+    };
 
-        if (!isDebatingRef.current) break;
-        
-        const newMessage: Message = { author: currentDebater, text: currentResponseText };
-        history.push(newMessage);
-        setDebateHistory([...history]);
+    const generateNextResponse = async () => {
+      if (!isDebatingRef.current) return;
+      
+      activeGenerators++;
+      try {
+          const nextDebater = tempHistory.length % 2 === 0 ? Debater.Alpha : Debater.Beta;
+          const text = await getAIResponse(newTopic, nextDebater, tempHistory);
+
+          if (!isDebatingRef.current) return;
+
+          const newMessage: Message = { author: nextDebater, text: text || "..." };
+          tempHistory.push(newMessage);
+
+          let audioBuffer: AudioBuffer | null = null;
+          if (text && text.trim() !== '') {
+              const voiceName = nextDebater === Debater.Alpha ? AI_ALPHA_VOICE : AI_BETA_VOICE;
+              audioBuffer = await ttsService.generateAudio(text, voiceName);
+          }
+          
+          if (isDebatingRef.current) {
+              addToQueue({ message: newMessage, audioBuffer });
+          }
+      } catch (e) {
+          console.error("Error generating response in queue", e);
+          setError("An error occurred while generating a response.");
+          isDebatingRef.current = false; // Stop the debate
+      } finally {
+          activeGenerators--;
+      }
+    };
+
+    // --- Initial Preloading ---
+    for (let i = 0; i < PRELOAD_TARGET_COUNT; i++) {
+        await generateNextResponse();
+        if (!isDebatingRef.current) break; // Stop if error or manual stop
+        if (tempHistory.length > 0 && tempHistory[tempHistory.length - 1].text.toLowerCase().startsWith('i concede')) {
+            break;
+        }
+    }
+    setIsLoading(false);
+
+    // --- Main Playback Loop ---
+    let playbackIndex = 0;
+    while (isDebatingRef.current) {
+        if (preloadedQueueRef.current.length === 0) {
+            if (activeGenerators > 0) {
+                setIsLoading(true);
+                await new Promise(r => setTimeout(r, 200));
+                continue;
+            } else {
+                break; // Queue is empty and nothing is generating, so we're done
+            }
+        }
         setIsLoading(false);
 
-        if (currentResponseText.trim().toLowerCase().startsWith('i concede')) {
-          break;
+        const currentResponse = preloadedQueueRef.current.shift();
+        if (!currentResponse) continue;
+
+        // Fire-and-forget the next generation
+        if (!currentResponse.message.text.toLowerCase().startsWith('i concede')) {
+            generateNextResponse();
+        }
+
+        // Display and speak the current response
+        setDebateHistory(prev => [...prev, currentResponse.message]);
+        
+        if (currentResponse.audioBuffer) {
+            await speakBuffer(currentResponse.audioBuffer, playbackIndex);
         }
         
-        const nextDebater = (currentDebater === Debater.Alpha) ? Debater.Beta : Debater.Alpha;
-        nextResponsePromise = getAIResponse(newTopic, nextDebater, history);
-        
-        await speakMessage(newMessage, history.length - 1);
-        
-        if (!isDebatingRef.current) break;
+        playbackIndex++;
 
-        currentDebater = nextDebater;
-      }
-    } catch (e) {
-      setError(`An error occurred during the debate. Please try again.`);
-      console.error(e);
-    } finally {
-      setIsLoading(false);
-      setIsDebateFinished(true);
-      setIsDebating(false);
-      setCurrentlySpeakingIndex(null);
+        if (currentResponse.message.text.toLowerCase().startsWith('i concede')) {
+            break; // End debate
+        }
     }
-  }, [speakMessage]);
+
+    // --- Cleanup ---
+    setIsLoading(false);
+    setIsDebateFinished(true);
+    setIsDebating(false);
+    setCurrentlySpeakingIndex(null);
+  }, [speakBuffer]);
   
   useEffect(() => {
     if (isDebating && topic) {
@@ -184,7 +229,7 @@ const App: React.FC = () => {
 
         {error && <div className="text-rose-300 p-3 bg-rose-950/50 rounded-lg text-center">{error}</div>}
 
-        <DebateView messages={debateHistory} isLoading={isLoading} currentlySpeakingIndex={currentlySpeakingIndex}/>
+        <DebateView messages={debateHistory} isLoading={isLoading} currentlySpeakingIndex={currentlySpeakingIndex} />
         
       </main>
     </div>
