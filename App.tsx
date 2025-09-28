@@ -165,6 +165,7 @@ const App: React.FC = () => {
 
 
   const handleStartDebate = useCallback((newTopic: string) => {
+    ttsService.resumeContext(); // Unlock audio for mobile browsers
     setTopic(newTopic);
     setIsDebating(true);
     setError(null);

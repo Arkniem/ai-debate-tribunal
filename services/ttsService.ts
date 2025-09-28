@@ -56,6 +56,12 @@ class GeminiTTSService {
         this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     }
 
+    public resumeContext() {
+        if (this.outputAudioContext.state === 'suspended') {
+            this.outputAudioContext.resume().catch(e => console.error("Error resuming AudioContext on user gesture", e));
+        }
+    }
+
     public async generateAudio(text: string, voiceName: string): Promise<AudioBuffer | null> {
         try {
             const response = await this.ai.models.generateContent({
