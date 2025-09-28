@@ -1,0 +1,7 @@
+{
+  "name": "Ai Debate Tribunal",
+  "description": "An application where two AI agents debate each other on a topic provided by the user. The AIs take opposing sides and build upon the entire conversation history for a dynamic debate.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
