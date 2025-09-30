@@ -6,11 +6,14 @@ import { ttsService } from './services/ttsService';
 import TopicInput from './components/TopicInput';
 import DebateView from './components/DebateView';
 import ScalesIcon from './components/icons/ScalesIcon';
+import PauseIcon from './components/icons/PauseIcon';
+import PlayIcon from './components/icons/PlayIcon';
+import StopIcon from './components/icons/StopIcon';
+
 
 // High-quality voices for the AI Debaters.
 const AI_ALPHA_VOICE = 'Autonoe';
 const AI_BETA_VOICE = 'Schedar';
-const PRELOAD_TARGET_COUNT = 6; // 3 responses per debater
 
 interface PreloadedResponse {
   message: Message;
@@ -22,16 +25,22 @@ const App: React.FC = () => {
   const [debateHistory, setDebateHistory] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isDebating, setIsDebating] = useState<boolean>(false);
+  const [isPaused, setIsPaused] = useState<boolean>(false);
   const [isDebateFinished, setIsDebateFinished] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [currentlySpeakingIndex, setCurrentlySpeakingIndex] = useState<number | null>(null);
   
   const isDebatingRef = useRef(isDebating);
+  const isPausedRef = useRef(isPaused);
   const preloadedQueueRef = useRef<PreloadedResponse[]>([]);
 
   useEffect(() => {
     isDebatingRef.current = isDebating;
   }, [isDebating]);
+
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
 
   useEffect(() => {
     // Cleanup TTS service on component unmount
@@ -59,10 +68,9 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const runDebate = useCallback(async (newTopic: string) => {
+  const runDebate = useCallback(async (debateTopic: string) => {
     setIsLoading(true);
     setError(null);
-    setDebateHistory([]);
     setIsDebateFinished(false);
     preloadedQueueRef.current = []; // Reset queue for new debate
 
@@ -74,13 +82,20 @@ const App: React.FC = () => {
     };
 
     const generateNextResponse = async () => {
+      // This lock ensures only one generation runs at a time, fixing the race condition.
+      if (activeGenerators > 0) {
+        return;
+      }
+      
+      // The debate might have been stopped while this was queued.
       if (!isDebatingRef.current) return;
       
       activeGenerators++;
       try {
           const nextDebater = tempHistory.length % 2 === 0 ? Debater.Alpha : Debater.Beta;
-          const text = await getAIResponse(newTopic, nextDebater, tempHistory);
-
+          const text = await getAIResponse(debateTopic, nextDebater, tempHistory);
+          
+          // The debate might have been stopped while waiting for the AI response.
           if (!isDebatingRef.current) return;
 
           const newMessage: Message = { author: nextDebater, text: text || "..." };
@@ -104,34 +119,33 @@ const App: React.FC = () => {
       }
     };
 
-    // --- Initial Preloading ---
-    for (let i = 0; i < PRELOAD_TARGET_COUNT; i++) {
-        await generateNextResponse();
-        if (!isDebatingRef.current) break; // Stop if error or manual stop
-        if (tempHistory.length > 0 && tempHistory[tempHistory.length - 1].text.toLowerCase().startsWith('i concede')) {
-            break;
-        }
-    }
-    setIsLoading(false);
+    // --- Kick off the first response generation ---
+    generateNextResponse();
 
     // --- Main Playback Loop ---
     let playbackIndex = 0;
     while (isDebatingRef.current) {
+        while (isPausedRef.current && isDebatingRef.current) {
+            if (isLoading) setIsLoading(false);
+            await new Promise(r => setTimeout(r, 200));
+        }
+        if (!isDebatingRef.current) break;
+
         if (preloadedQueueRef.current.length === 0) {
             if (activeGenerators > 0) {
-                setIsLoading(true);
+                if (!isLoading) setIsLoading(true);
                 await new Promise(r => setTimeout(r, 200));
                 continue;
             } else {
                 break; // Queue is empty and nothing is generating, so we're done
             }
         }
-        setIsLoading(false);
+        if (isLoading) setIsLoading(false);
 
         const currentResponse = preloadedQueueRef.current.shift();
         if (!currentResponse) continue;
 
-        // Fire-and-forget the next generation
+        // Request the next response now, so it generates while this one is speaking.
         if (!currentResponse.message.text.toLowerCase().startsWith('i concede')) {
             generateNextResponse();
         }
@@ -154,26 +168,38 @@ const App: React.FC = () => {
     setIsLoading(false);
     setIsDebateFinished(true);
     setIsDebating(false);
+    setIsPaused(false);
     setCurrentlySpeakingIndex(null);
   }, [speakBuffer]);
-  
-  useEffect(() => {
-    if (isDebating && topic) {
-      runDebate(topic);
-    }
-  }, [isDebating, topic, runDebate]);
-
 
   const handleStartDebate = useCallback((newTopic: string) => {
     ttsService.resumeContext(); // Unlock audio for mobile browsers
     setTopic(newTopic);
     setIsDebating(true);
+    setIsPaused(false);
     setError(null);
     setIsDebateFinished(false);
-  }, []);
+    setDebateHistory([]); // Clear previous debate artifacts immediately
+
+    // This pushes the execution of runDebate to the next event loop tick.
+    // This is crucial because it allows React to commit the state updates above (like setIsDebating)
+    // and run the useEffect that updates isDebatingRef.current. Without this,
+    // runDebate would start with a stale isDebatingRef.current value (false),
+    // causing its main loop to terminate instantly.
+    setTimeout(() => runDebate(newTopic), 0);
+  }, [runDebate]);
+
+  const handlePauseDebate = () => {
+    setIsPaused(true);
+  };
+  
+  const handleResumeDebate = () => {
+    setIsPaused(false);
+  };
 
   const handleStopDebate = () => {
     setIsDebating(false);
+    setIsPaused(false);
     ttsService.cancel();
   };
 
@@ -186,6 +212,7 @@ const App: React.FC = () => {
     setError(null);
     setCurrentlySpeakingIndex(null);
     setIsDebating(false);
+    setIsPaused(false);
   };
 
   return (
@@ -210,13 +237,35 @@ const App: React.FC = () => {
                     <h2 className="text-xl font-semibold text-white font-serif">{topic}</h2>
                 </div>
                 {isDebating ? (
-                     <button
-                        onClick={handleStopDebate}
-                        className="flex-shrink-0 px-6 py-2 bg-rose-900 text-white font-semibold rounded-lg hover:bg-rose-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-stone-900 focus:ring-rose-500 transition"
-                        aria-label="End the current debate"
-                      >
-                        End Debate
-                      </button>
+                    <div className="flex items-center gap-2">
+                        {!isPaused ? (
+                            <button
+                                onClick={handlePauseDebate}
+                                className="flex-shrink-0 px-4 py-2 bg-stone-600 text-white font-semibold rounded-lg hover:bg-stone-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-stone-900 focus:ring-amber-500 transition flex items-center gap-2"
+                                aria-label="Pause the debate"
+                            >
+                                <PauseIcon className="w-5 h-5" />
+                                <span>Pause</span>
+                            </button>
+                        ) : (
+                            <button
+                                onClick={handleResumeDebate}
+                                className="flex-shrink-0 px-4 py-2 bg-amber-700 text-slate-900 font-semibold rounded-lg hover:bg-amber-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-stone-900 focus:ring-amber-600 transition flex items-center gap-2"
+                                aria-label="Resume the debate"
+                            >
+                                <PlayIcon className="w-5 h-5" />
+                                <span>Resume</span>
+                            </button>
+                        )}
+                        <button
+                            onClick={handleStopDebate}
+                            className="flex-shrink-0 px-4 py-2 bg-rose-900 text-white font-semibold rounded-lg hover:bg-rose-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-stone-900 focus:ring-rose-500 transition flex items-center gap-2"
+                            aria-label="End the current debate"
+                        >
+                            <StopIcon className="w-5 h-5" />
+                            <span>End</span>
+                        </button>
+                    </div>
                 ) : (
                     <button
                         onClick={handleNewDebate}
